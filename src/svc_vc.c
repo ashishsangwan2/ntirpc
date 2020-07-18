@@ -715,6 +715,19 @@ int svc_xprt_recv(SVCXPRT *xprt, char *dst, int len, int recv_flags)
 	return rlen;
 }
 
+#define CONT_RECV_RPC_SIZE 4096
+
+static inline bool cont_recv(SVCXPRT *xprt, int rcv_len, int recv_counter)
+{
+	bool out = false;
+
+	if (rcv_len > CONT_RECV_RPC_SIZE &&
+	    (recv_counter < __ntirpc_pkg_params.cont_recv_limit) &&
+	    !(xprt->xp_flags & (SVC_XPRT_FLAG_DESTROYED)))
+		out = true;
+	 return out;
+}
+
 static enum xprt_stat
 svc_vc_recv(SVCXPRT *xprt)
 {
@@ -723,6 +736,9 @@ svc_vc_recv(SVCXPRT *xprt)
 	struct poolq_entry *have;
 	struct xdr_ioq_uv *uv;
 	struct xdr_ioq *xioq;
+	struct work_pool_entry *wpe;
+	struct svc_request_params *wpe_arg;
+	int recv_counter = 0, trlen;
 	ssize_t rlen;
 	u_int flags;
 
@@ -730,6 +746,8 @@ svc_vc_recv(SVCXPRT *xprt)
 	tracepoint(xprt, funcin, __func__, __LINE__, xprt);
 #endif /* USE_LTTNG_NTIRPC */
 
+restart:
+	trlen = 0;
 	/* no need for locking, only one svc_rqst_xprt_task() per event.
 	 * depends upon svc_rqst_rearm_events() for ordering.
 	 */
@@ -744,8 +762,27 @@ svc_vc_recv(SVCXPRT *xprt)
 	}
 
 	if (!xd->sx_fbtbc) {
-		rlen = svc_xprt_recv(xprt, (char *)&xd->sx_fbtbc,
-				     BYTES_PER_XDR_UNIT, MSG_WAITALL);
+		if (recv_counter) {
+			/* If this is not the first recv call, we cannot use
+			 * MSG_WAITALL as the current thread will block if
+			 * the data is not available on the socket. The below
+			 * while loop handles the pathalogical case when less
+			 * than BYTES_PER_XDR_UNIT bytes of data is read in
+			 * one recv call.
+			 */
+			while (trlen < BYTES_PER_XDR_UNIT) {
+				rlen = svc_xprt_recv(xprt,
+						(char *)&xd->sx_fbtbc + trlen,
+						BYTES_PER_XDR_UNIT - trlen,
+						MSG_DONTWAIT);
+				if (rlen <= 0)
+					break;
+				trlen += rlen;
+			}
+		} else {
+			rlen = svc_xprt_recv(xprt, (char *)&xd->sx_fbtbc,
+					     BYTES_PER_XDR_UNIT, MSG_WAITALL);
+		}
 		if (rlen <= 0) {
 			return SVC_STAT(xprt);
 		}
@@ -801,6 +838,9 @@ svc_vc_recv(SVCXPRT *xprt)
 		__func__, xprt, xprt->xp_fd, rlen, xd->sx_fbtbc, flags);
 
 	if (xd->sx_fbtbc || (flags & UIO_FLAG_MORE)) {
+		if (cont_recv(xprt, rlen + xd->sx_fbtbc, recv_counter++)) {
+			goto restart;
+		}
 		if (unlikely(svc_rqst_rearm_events(xprt,
 						   SVC_XPRT_FLAG_ADDED_RECV))) {
 			__warnx(TIRPC_DEBUG_FLAG_ERROR,
@@ -825,6 +865,21 @@ svc_vc_recv(SVCXPRT *xprt)
 	TAILQ_REMOVE(&rec->ioq.ioq_uv.uvqh.qh, &xioq->ioq_s, q);
 	xdr_ioq_reset(xioq, 0);
 
+	if (cont_recv(xprt, rlen, recv_counter++)) {
+		/* Submit the request to a new thread while the current
+		 * thread will continue reading from the socket without
+		 * adding to epoll fd.
+		 */
+		SVC_REF(xprt, SVC_REF_FLAG_NONE);
+		wpe = mem_alloc(sizeof(struct work_pool_entry));
+		wpe_arg = mem_alloc(sizeof(struct svc_request_params));
+		wpe_arg->xprt = xprt;
+		wpe_arg->xdrs = xioq->xdrs;
+		wpe->fun = svc_request_async;
+		wpe->arg = wpe_arg;
+		work_pool_submit(&svc_work_pool, wpe);
+		goto restart;
+	}
 	if (unlikely(svc_rqst_rearm_events(xprt, SVC_XPRT_FLAG_ADDED_RECV))) {
 		__warnx(TIRPC_DEBUG_FLAG_ERROR,
 			"%s: %p fd %d svc_rqst_rearm_events failed (will set dead)",
