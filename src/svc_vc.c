@@ -661,6 +661,60 @@ svc_vc_stat(SVCXPRT *xprt)
 	return (XPRT_IDLE);
 }
 
+int svc_xprt_recv(SVCXPRT *xprt, char *dst, int len, int recv_flags)
+{
+	int rlen;
+	int err;
+	int loglevel = (recv_flags == MSG_WAITALL) ?
+		       TIRPC_DEBUG_FLAG_WARN : TIRPC_DEBUG_FLAG_SVC_VC;
+
+	rlen = recv(xprt->xp_fd, dst, len, recv_flags);
+	if (unlikely(rlen < 0)) {
+		err = errno;
+
+		if (err == EAGAIN || err == EWOULDBLOCK) {
+			__warnx(loglevel,
+				"%s: %p fd %d recv errno %d (try again)",
+				"svc_vc_wait", xprt, xprt->xp_fd, err);
+			if (unlikely(svc_rqst_rearm_events(xprt,
+						SVC_XPRT_FLAG_ADDED_RECV))) {
+				__warnx(TIRPC_DEBUG_FLAG_ERROR,
+					"%s: %p fd %d svc_rqst_rearm_events failed (will set dead)",
+					"svc_vc_wait",
+					xprt, xprt->xp_fd);
+				SVC_DESTROY(xprt);
+				err = EINVAL;
+			}
+#ifdef USE_LTTNG_NTIRPC
+			tracepoint(xprt, recv_exit, __func__, __LINE__,
+				   xprt, "EAGAIN", err);
+#endif /* USE_LTTNG_NTIRPC */
+			return rlen;
+		}
+		__warnx(TIRPC_DEBUG_FLAG_WARN,
+			"%s: %p fd %d recv errno %d (will set dead)",
+			"svc_vc_wait", xprt, xprt->xp_fd, err);
+			SVC_DESTROY(xprt);
+#ifdef USE_LTTNG_NTIRPC
+		tracepoint(xprt, recv_exit, __func__, __LINE__,
+			   xprt, "ERROR", err);
+#endif /* USE_LTTNG_NTIRPC */
+		return rlen;
+	}
+
+	if (unlikely(!rlen)) {
+		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"%s: %p fd %d recv closed (will set dead)",
+			"svc_vc_wait", xprt, xprt->xp_fd);
+		SVC_DESTROY(xprt);
+#ifdef USE_LTTNG_NTIRPC
+		tracepoint(xprt, recv_exit, __func__, __LINE__,
+			   xprt, "EMPTY", 0);
+#endif /* USE_LTTNG_NTIRPC */
+	}
+	return rlen;
+}
+
 static enum xprt_stat
 svc_vc_recv(SVCXPRT *xprt)
 {
@@ -671,7 +725,6 @@ svc_vc_recv(SVCXPRT *xprt)
 	struct xdr_ioq *xioq;
 	ssize_t rlen;
 	u_int flags;
-	int code;
 
 #ifdef USE_LTTNG_NTIRPC
 	tracepoint(xprt, funcin, __func__, __LINE__, xprt);
@@ -691,55 +744,11 @@ svc_vc_recv(SVCXPRT *xprt)
 	}
 
 	if (!xd->sx_fbtbc) {
-		rlen = recv(xprt->xp_fd, &xd->sx_fbtbc, BYTES_PER_XDR_UNIT,
-			    MSG_WAITALL);
-
-		if (unlikely(rlen < 0)) {
-			code = errno;
-
-			if (code == EAGAIN || code == EWOULDBLOCK) {
-				__warnx(TIRPC_DEBUG_FLAG_WARN,
-					"%s: %p fd %d recv errno %d (try again)",
-					"svc_vc_wait", xprt, xprt->xp_fd, code);
-				if (unlikely(svc_rqst_rearm_events(
-						xprt,
-						SVC_XPRT_FLAG_ADDED_RECV))) {
-					__warnx(TIRPC_DEBUG_FLAG_ERROR,
-						"%s: %p fd %d svc_rqst_rearm_events failed (will set dead)",
-						"svc_vc_wait",
-						xprt, xprt->xp_fd);
-					SVC_DESTROY(xprt);
-					code = EINVAL;
-				}
-#ifdef USE_LTTNG_NTIRPC
-				tracepoint(xprt, recv_exit, __func__, __LINE__,
-					   xprt, "EAGAIN", code);
-#endif /* USE_LTTNG_NTIRPC */
-				return SVC_STAT(xprt);
-			}
-			__warnx(TIRPC_DEBUG_FLAG_WARN,
-				"%s: %p fd %d recv errno %d (will set dead)",
-				"svc_vc_wait", xprt, xprt->xp_fd, code);
-			SVC_DESTROY(xprt);
-#ifdef USE_LTTNG_NTIRPC
-			tracepoint(xprt, recv_exit, __func__, __LINE__,
-				   xprt, "ERROR", code);
-#endif /* USE_LTTNG_NTIRPC */
+		rlen = svc_xprt_recv(xprt, (char *)&xd->sx_fbtbc,
+				     BYTES_PER_XDR_UNIT, MSG_WAITALL);
+		if (rlen <= 0) {
 			return SVC_STAT(xprt);
 		}
-
-		if (unlikely(!rlen)) {
-			__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
-				"%s: %p fd %d recv closed (will set dead)",
-				"svc_vc_wait", xprt, xprt->xp_fd);
-			SVC_DESTROY(xprt);
-#ifdef USE_LTTNG_NTIRPC
-			tracepoint(xprt, recv_exit, __func__, __LINE__,
-				   xprt, "EMPTY", 0);
-#endif /* USE_LTTNG_NTIRPC */
-			return SVC_STAT(xprt);
-		}
-
 		xd->sx_fbtbc = (int32_t)ntohl((long)xd->sx_fbtbc);
 		flags = UIO_FLAG_FREE | UIO_FLAG_MORE;
 
@@ -773,53 +782,12 @@ svc_vc_recv(SVCXPRT *xprt)
 		flags = uv->u.uio_flags;
 	}
 
-	rlen = recv(xprt->xp_fd, uv->v.vio_tail, xd->sx_fbtbc, MSG_DONTWAIT);
+	rlen = svc_xprt_recv(xprt, (char *)uv->v.vio_tail,
+			     xd->sx_fbtbc, MSG_DONTWAIT);
 
-	if (unlikely(rlen < 0)) {
-		code = errno;
-
-		if (code == EAGAIN || code == EWOULDBLOCK) {
-			__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
-				"%s: %p fd %d recv errno %d (try again)",
-				__func__, xprt, xprt->xp_fd, code);
-			if (unlikely(svc_rqst_rearm_events(
-						xprt,
-						SVC_XPRT_FLAG_ADDED_RECV))) {
-				__warnx(TIRPC_DEBUG_FLAG_ERROR,
-					"%s: %p fd %d svc_rqst_rearm_events failed (will set dead)",
-					__func__, xprt, xprt->xp_fd);
-				SVC_DESTROY(xprt);
-				code = EINVAL;
-			}
-#ifdef USE_LTTNG_NTIRPC
-			tracepoint(xprt, recv_exit, __func__, __LINE__,
-				   xprt, "EAGAIN", code);
-#endif /* USE_LTTNG_NTIRPC */
-			return SVC_STAT(xprt);
-		}
-		__warnx(TIRPC_DEBUG_FLAG_ERROR,
-			"%s: %p fd %d recv errno %d (will set dead)",
-			__func__, xprt, xprt->xp_fd, code);
-		SVC_DESTROY(xprt);
-#ifdef USE_LTTNG_NTIRPC
-		tracepoint(xprt, recv_exit, __func__, __LINE__,
-			   xprt, "ERROR", code);
-#endif /* USE_LTTNG_NTIRPC */
+	if (rlen <= 0) {
 		return SVC_STAT(xprt);
 	}
-
-	if (unlikely(!rlen)) {
-		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
-			"%s: %p fd %d recv closed (will set dead)",
-			__func__, xprt, xprt->xp_fd);
-		SVC_DESTROY(xprt);
-#ifdef USE_LTTNG_NTIRPC
-		tracepoint(xprt, recv_exit, __func__, __LINE__,
-			   xprt, "EMPTY", 0);
-#endif /* USE_LTTNG_NTIRPC */
-		return SVC_STAT(xprt);
-	}
-
 #ifdef USE_LTTNG_NTIRPC
 	tracepoint(xprt, recv_bytes, __func__, __LINE__,
 		   xprt, xd->sx_fbtbc, rlen);
